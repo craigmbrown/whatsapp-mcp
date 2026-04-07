@@ -1,0 +1,29 @@
+[Unit]
+Description=WhatsApp Bridge Service
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+User=craigmbrown
+WorkingDirectory=/home/craigmbrown/Project/whatsapp-mcp/whatsapp-bridge
+ExecStart=/usr/local/go/bin/go run main.go
+StandardOutput=append:/home/craigmbrown/Project/logs/whatsapp_bridge.log
+StandardError=append:/home/craigmbrown/Project/logs/whatsapp_bridge_error.log
+
+# Environment variables
+Environment="HOME=/home/craigmbrown"
+Environment="PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Restart configuration
+RestartPreventExitStatus=0
+SuccessExitStatus=0 143
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
