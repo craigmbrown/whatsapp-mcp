@@ -7,8 +7,16 @@ import requests
 import json
 import audio
 
+
+# Claude Advanced Tools Integration
+try:
+    from claude_advanced_tools import ToolRegistry, ToolSearchEngine, PatternLearner
+    ADVANCED_TOOLS_ENABLED = True
+except ImportError:
+    ADVANCED_TOOLS_ENABLED = False
+
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = "http://localhost:8082/api"
 
 @dataclass
 class Message:
@@ -629,9 +637,13 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             return False, "Recipient must be provided"
         
         url = f"{WHATSAPP_API_BASE_URL}/send"
+        # RQ-WA-CLASSES-01: an MCP send is an operator-driven session message.
+        # The bridge caps session_summary per day; there is no key dedup.
         payload = {
             "recipient": recipient,
             "message": message,
+            "class": "session_summary",
+            "source": "mcp-whatsapp",
         }
         
         response = requests.post(url, json=payload)
