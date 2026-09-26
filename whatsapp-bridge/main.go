@@ -13,6 +13,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -200,6 +202,10 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// RQ-WA-CLASSES-01: bridge-side policy fields (see policy.go)
+	Class  string `json:"class,omitempty"`
+	Key    string `json:"key,omitempty"`
+	Source string `json:"source,omitempty"`
 }
 
 // Function to send a WhatsApp message
@@ -641,7 +647,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	ctx := context.Background()
+	mediaData, err := client.Download(ctx, downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -705,6 +712,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
+		// RQ-WA-CLASSES-01: the bridge decides, not the caller.
+		w.Header().Set("Content-Type", "application/json")
+		decision := policyCheck(req)
+		if !decision.Allow {
+			fmt.Println("Message refused by policy:", decision.Reason)
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false, "message": "policy: " + decision.Reason,
+				"reason": decision.Reason, "policy": true,
+			})
+			return
+		}
+		if decision.Deferred {
+			enqueueDeferred(req)
+			fmt.Println("Message held for quiet hours:", req.Class, req.Key)
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true, "deferred": true, "message": "held until quiet hours end (07:00 ET)",
+				"reason": decision.Reason,
+			})
+			return
+		}
+
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
@@ -720,6 +750,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
+		})
+	})
+
+	// RQ-WA-CLASSES-01: read-only policy summary
+	http.HandleFunc("/api/policy", func(w http.ResponseWriter, r *http.Request) {
+		policyMu.Lock()
+		ensurePolicyLoaded()
+		st := loadPolicyState()
+		policyMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enforce": policyCfg.Enforce, "daily": st.Daily, "keys": len(st.Keys),
+			"quiet_now": policyCfg.inQuietHours(time.Now()), "connected": client.IsConnected(),
+			"logged_in": client.IsLoggedIn(),
 		})
 	})
 
@@ -774,6 +818,174 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for getting messages
+	http.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Check if message store is available
+		if messageStore == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "Message store not initialized",
+			})
+			return
+		}
+
+		// Get query parameters
+		chatJID := r.URL.Query().Get("chat_jid")
+		limitStr := r.URL.Query().Get("limit")
+		senderPhone := r.URL.Query().Get("sender_phone_number")
+		
+		// Default limit
+		limit := 20
+		if limitStr != "" {
+			if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+				limit = parsedLimit
+			}
+		}
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// If specific chat JID is provided, get messages from that chat
+		if chatJID != "" {
+			messages, err := messageStore.GetMessages(chatJID, limit)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"error":   err.Error(),
+				})
+				return
+			}
+			
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":  true,
+				"messages": messages,
+			})
+			return
+		}
+
+		// If sender phone is provided, use it as JID
+		if senderPhone != "" {
+			jid := senderPhone + "@s.whatsapp.net"
+			messages, err := messageStore.GetMessages(jid, limit)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"error":   err.Error(),
+				})
+				return
+			}
+			
+			// Format messages for the monitor
+			formattedMessages := make([]map[string]interface{}, 0)
+			for _, msg := range messages {
+				msgMap := map[string]interface{}{
+					"id":       fmt.Sprintf("%s_%d", jid, msg.Time.Unix()),
+					"sender":   msg.Sender,
+					"content":  msg.Content,
+					"time":     msg.Time.Format(time.RFC3339),
+					"is_from_me": msg.IsFromMe,
+				}
+				
+				// Add media information if available
+				if msg.MediaType != "" {
+					msgMap["has_media"] = true
+					msgMap["media_type"] = msg.MediaType
+					msgMap["media_id"] = fmt.Sprintf("%s_%d", jid, msg.Time.Unix())
+					if msg.Filename != "" {
+						msgMap["filename"] = msg.Filename
+					}
+				} else {
+					msgMap["has_media"] = false
+				}
+				
+				formattedMessages = append(formattedMessages, msgMap)
+			}
+			
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":  true,
+				"messages": formattedMessages,
+			})
+			return
+		}
+
+		// Get all recent messages from all chats
+		allMessages := make([]map[string]interface{}, 0)
+		chats, err := messageStore.GetChats()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   err.Error(),
+			})
+			return
+		}
+
+		// Get messages from each chat
+		for chatJID := range chats {
+			messages, err := messageStore.GetMessages(chatJID, 5) // Get last 5 from each chat
+			if err != nil {
+				continue
+			}
+			
+			for _, msg := range messages {
+				msgMap := map[string]interface{}{
+					"id":       fmt.Sprintf("%s_%d", chatJID, msg.Time.Unix()),
+					"chat_jid": chatJID,
+					"sender":   msg.Sender,
+					"content":  msg.Content,
+					"time":     msg.Time.Format(time.RFC3339),
+					"is_from_me": msg.IsFromMe,
+				}
+				
+				// Add media information if available
+				if msg.MediaType != "" {
+					msgMap["has_media"] = true
+					msgMap["media_type"] = msg.MediaType
+					msgMap["media_id"] = fmt.Sprintf("%s_%d", chatJID, msg.Time.Unix())
+					if msg.Filename != "" {
+						msgMap["filename"] = msg.Filename
+					}
+				} else {
+					msgMap["has_media"] = false
+				}
+				
+				allMessages = append(allMessages, msgMap)
+			}
+		}
+
+		// Sort by time (newest first)
+		sort.Slice(allMessages, func(i, j int) bool {
+			timeI, _ := time.Parse(time.RFC3339, allMessages[i]["time"].(string))
+			timeJ, _ := time.Parse(time.RFC3339, allMessages[j]["time"].(string))
+			return timeI.After(timeJ)
+		})
+
+		// Limit the results
+		if len(allMessages) > limit {
+			allMessages = allMessages[:limit]
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"messages": allMessages,
+		})
+	})
+
+	// RQ-WA-CLASSES-01: flush quiet-hours holds once the window ends
+	startDeferredFlusher(func(recipient, message string) (bool, string) {
+		return sendWhatsAppMessage(client, recipient, message, "")
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +1012,15 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	ctx := context.Background()
+	container, err := sqlstore.New(ctx, "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -906,7 +1119,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, 8082)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1186,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			ctx := context.Background()
+			groupInfo, err := client.GetGroupInfo(ctx, jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1202,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		ctx := context.Background()
+		contact, err := client.Store.Contacts.GetContact(ctx, jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

@@ -92,16 +92,24 @@ def convert_to_opus_ogg_temp(input_file, bitrate="32k", sample_rate=24000):
         raise e
 
 
+# Claude Advanced Tools Integration
+try:
+    from claude_advanced_tools import ToolRegistry, ToolSearchEngine, PatternLearner
+    ADVANCED_TOOLS_ENABLED = True
+except ImportError:
+    ADVANCED_TOOLS_ENABLED = False
+
+
 if __name__ == "__main__":
     # Example usage
     import sys
-    
+
     if len(sys.argv) < 2:
         print("Usage: python audio.py input_file [output_file]")
         sys.exit(1)
-    
+
     input_file = sys.argv[1]
-    
+
     try:
         result = convert_to_opus_ogg_temp(input_file)
         print(f"Successfully converted to: {result}")
